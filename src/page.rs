@@ -8,6 +8,8 @@
 //! ddns-scripts reads for that provider. It always writes `lookup_host`: an
 //! updater that finds none sets it and runs `uci commit ddns` itself.
 
+use std::net::IpAddr;
+
 use verso_plugin::{
     json, uci_text, ColumnWidth, CommitOp, Envelope, Errors, Field, Form, HeadingAct, Map,
     RowDrawer, SelectOption, Table, TableCell, TableChip, TableColumn, TableRow, TableRowAct, Tone,
@@ -378,14 +380,19 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
                 }],
                 ..Default::default()
             },
-            match live.address.as_str() {
-                "" => TableCell {
+            match live
+                .address
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(", ")
+            {
+                a if a.is_empty() => TableCell {
                     text: DASH.into(),
                     muted: true,
                     ..Default::default()
                 },
                 a => TableCell {
-                    text: a.into(),
+                    text: a,
                     emphasis: true,
                     ..Default::default()
                 },
@@ -419,15 +426,54 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
     }
 }
 
-/// state is a service's state in a word and its tone. Switched off is the
-/// resting state; switched on with no updater running is a failure, since
-/// ddns-scripts' updater exits once it gives up.
+/// state is a service's state in a word and its tone: whether the name points
+/// at the router, which is what the page is for. The name's address is what the
+/// updater last resolved it to; the router's is its network's now. A running
+/// updater is not a working one: ddns-scripts retries a refused update forever.
+///
+/// A private address under `network` is one no provider takes: the router sits
+/// behind another. Asking the internet, it cannot see what the internet said,
+/// so it claims no more than that the updater runs. An address read some other
+/// way, set by hand, gets no verdict either.
 fn state(d: &Ddns, s: &Service) -> (&'static str, &'static str) {
-    match (s.enabled, d.known, &s.live) {
-        (false, _, _) => ("off", ""),
-        (true, false, _) => ("unknown", ""),
-        (true, true, Some(l)) if l.running => ("running", "success"),
-        (true, true, _) => ("not running", "danger"),
+    let live = match (s.enabled, d.known, &s.live) {
+        (false, _, _) => return ("off", ""),
+        (true, false, _) => return ("unknown", ""),
+        (true, true, Some(l)) if l.running => l,
+        (true, true, _) => return ("not running", "danger"),
+    };
+    let Some(current) = d.current(s).filter(|_| s.edits_source()) else {
+        return ("running", "");
+    };
+    // The updater writes every address the name resolves to, one a line.
+    let named: Vec<IpAddr> = live
+        .address
+        .split_whitespace()
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    match (private(&current), s.by_network()) {
+        (true, true) => ("private address", "warning"),
+        (true, false) => ("running", ""),
+        _ if named.is_empty() => ("not resolving", "warning"),
+        _ if named.contains(&current) => ("points here", "success"),
+        _ => ("points elsewhere", "warning"),
+    }
+}
+
+/// private is an address ddns-scripts refuses to send: IPv4's private, shared
+/// (carrier NAT), loopback and link-local ranges, and IPv6 outside global
+/// unicast.
+fn private(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 != 0x2000,
     }
 }
 
@@ -690,6 +736,7 @@ fn secret(label: &str, s: &Service, e: &Errors) -> Widget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Addresses;
     use verso_plugin::{Request, Snapshot, Ubus};
 
     fn request(snapshot: Value, state: Value) -> Request {
@@ -979,6 +1026,83 @@ mod tests {
         assert!(!out.contains_key("username"), "{out:?}");
         let switched = resaved(&saved("", "wan", "wan"), "provider=cloudflare.com-v4&lookup_host=home.example.com&zone=example.com&ip_network=wan");
         assert_eq!(switched["username"], "Bearer");
+    }
+
+    fn wan(d: &mut Ddns, address: &str) {
+        d.addresses.insert(
+            "wan".into(),
+            Addresses {
+                v4: address.parse().ok(),
+                v6: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_name_says_whether_it_points_at_the_router() {
+        let mut d = router();
+        let home = |d: &Ddns| state(d, &d.services[0]);
+        // Nothing to compare with: the updater runs, and that is all that is known.
+        assert_eq!(home(&d), ("running", ""));
+        wan(&mut d, "203.0.113.7");
+        assert_eq!(home(&d), ("points here", "success"));
+        wan(&mut d, "198.51.100.4");
+        assert_eq!(home(&d), ("points elsewhere", "warning"));
+        d.services[0].live.as_mut().unwrap().address = String::new();
+        assert_eq!(home(&d), ("not resolving", "warning"));
+        // A name with several addresses points here when one of them is ours.
+        d.services[0].live.as_mut().unwrap().address = "203.0.113.9\n198.51.100.4".into();
+        assert_eq!(home(&d), ("points here", "success"));
+        let b = body(&page(&d, ""));
+        assert_eq!(
+            b["widget"]["rows"][0]["cells"][3]["text"],
+            "203.0.113.9, 198.51.100.4"
+        );
+    }
+
+    #[test]
+    fn a_private_address_says_the_router_sits_behind_another() {
+        let mut d = router();
+        for private in ["192.168.1.20", "172.30.1.171", "10.0.0.2", "100.72.4.1"] {
+            wan(&mut d, private);
+            assert_eq!(
+                state(&d, &d.services[0]),
+                ("private address", "warning"),
+                "{private}"
+            );
+        }
+        // Asking the internet, the router cannot see what it was told: no verdict.
+        d.services[0].source = WEB.into();
+        assert_eq!(state(&d, &d.services[0]), ("running", ""));
+        wan(&mut d, "203.0.113.7");
+        assert_eq!(state(&d, &d.services[0]), ("points here", "success"));
+    }
+
+    #[test]
+    fn the_router_reads_its_address_as_ddns_scripts_does() {
+        let mut r = request(
+            json!({}),
+            json!({"networkState": {"interfaces": [
+                {"interface": "wan", "ipv4-address": [{"address": "203.0.113.7", "mask": 24}]},
+                {"interface": "wan6", "ipv6-address": [],
+                    "ipv6-prefix-assignment": [{"address": "2001:db8:1::", "mask": 64,
+                        "local-address": {"address": "2001:db8:1::1", "mask": 64}}]}
+            ]}}),
+        );
+        r.query = Form::default();
+        let d = Ddns::read(&r);
+        let mut s = Service {
+            network: "wan6".into(),
+            v6: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            d.current(&s),
+            "2001:0db8:0001:0000:0000:0000:0000:0001".parse().ok()
+        );
+        s.network = "wan".into();
+        s.v6 = false;
+        assert_eq!(d.current(&s), "203.0.113.7".parse().ok());
     }
 
     #[test]

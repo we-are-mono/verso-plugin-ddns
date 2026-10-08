@@ -5,6 +5,9 @@
 //! section, translated from the options each provider spells its own way into
 //! one hostname and one secret, beside what its updater last did.
 
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
 use verso_plugin::{Map, Request, Section, Value};
 
 pub const CONFIG: &str = "ddns";
@@ -88,6 +91,17 @@ pub struct Ddns {
     /// Whether the helper's read of the updaters arrived. Without it their
     /// state is unknown, which is not the same as stopped.
     pub known: bool,
+    /// Each network's address now, by name, from netifd.
+    pub addresses: BTreeMap<String, Addresses>,
+}
+
+/// Addresses is the one address of each family ddns-scripts reads from a
+/// network: its first IPv4 address; its first IPv6 address, or else the
+/// router's own address in its first delegated prefix.
+#[derive(Default)]
+pub struct Addresses {
+    pub v4: Option<IpAddr>,
+    pub v6: Option<IpAddr>,
 }
 
 /// Service is one section as the drawer edits it. Read from the section, or
@@ -148,10 +162,41 @@ impl Ddns {
             .map(Section::name)
             .filter(|n| n != "loopback")
             .collect();
+        let address = |v: &Value| v["address"].as_str().and_then(|a| a.parse().ok());
+        let addresses = request
+            .ubus
+            .get("networkState")
+            .and_then(|s| s["interfaces"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|i| {
+                let addresses = Addresses {
+                    v4: address(&i["ipv4-address"][0]),
+                    v6: address(&i["ipv6-address"][0])
+                        .or_else(|| address(&i["ipv6-prefix-assignment"][0]["local-address"])),
+                };
+                (
+                    i["interface"].as_str().unwrap_or_default().to_string(),
+                    addresses,
+                )
+            })
+            .collect();
         Ddns {
             services,
             networks,
             known: state.is_some(),
+            addresses,
+        }
+    }
+
+    /// current is the address a service's network holds now in its family,
+    /// if the shell's read of the networks arrived and the network has one.
+    pub fn current(&self, s: &Service) -> Option<IpAddr> {
+        let a = self.addresses.get(&s.network)?;
+        if s.v6 {
+            a.v6
+        } else {
+            a.v4
         }
     }
 

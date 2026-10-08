@@ -10,7 +10,8 @@
     "read": [
       { "scope": "uci", "object": "ddns", "function": "read" },
       { "scope": "uci", "object": "network", "function": "read" },
-      { "scope": "ubus", "object": "verso", "function": "ddnsState" }
+      { "scope": "ubus", "object": "verso", "function": "ddnsState" },
+      { "scope": "ubus", "object": "verso", "function": "networkState" }
     ],
     "write": [
       { "scope": "uci", "object": "ddns", "function": "write" }
