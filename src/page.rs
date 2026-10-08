@@ -15,7 +15,8 @@ use verso_plugin::{
 };
 
 use crate::model::{
-    provider, Ddns, Service, User, CLOUDFLARE, CONFIG, CUSTOM, DUCKDNS, DUCKDNS_SUFFIX, PROVIDERS,
+    provider, Ddns, Service, User, CLOUDFLARE, CONFIG, CUSTOM, DUCKDNS, DUCKDNS_SUFFIX, NETWORK,
+    PROVIDERS, WEB,
 };
 
 const HEADING: &str = "Dynamic DNS";
@@ -66,6 +67,11 @@ pub fn post(d: &Ddns, open: &str, form: &Form) -> Envelope {
         }]);
     }
     let posted = posted(existing, form);
+    // A new address source is the drawer drawn again around it, unsaved.
+    if form.get("_action") == "reshape" {
+        let panel = drawer(d, existing, &posted, &Errors::default());
+        return listing(d, open, Some(panel));
+    }
     let errors = validate(d, existing, &posted);
     let answer = listing(d, open, Some(drawer(d, existing, &posted, &errors)));
     if !errors.is_empty() {
@@ -114,9 +120,17 @@ fn posted(existing: Option<&Service>, f: &Form) -> Service {
         url: trimmed("update_url"),
         v6: f.get("use_ipv6") == "1",
         // Options the drawer does not show carry over from the section.
-        source: existing.map(|s| s.source.clone()).unwrap_or_default(),
+        source: match (existing, f.get("ip_source")) {
+            (Some(s), _) if !s.edits_source() => s.source.clone(),
+            (Some(s), chosen) if chosen.is_empty() => s.source.clone(),
+            (_, chosen) => chosen,
+        },
+        ip_url: match f.get("ip_source") == WEB {
+            true => trimmed("ip_url"),
+            false => existing.map(|s| s.ip_url.clone()).unwrap_or_default(),
+        },
         network: match existing {
-            Some(s) if !s.by_network() => s.network.clone(),
+            Some(s) if !s.edits_source() => s.network.clone(),
             _ => f.get("ip_network"),
         },
         interface: existing.map(|s| s.interface.clone()).unwrap_or_default(),
@@ -198,8 +212,16 @@ fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
     );
     e.check(
         "ip_network",
-        !s.by_network() || d.networks.contains(&s.network),
+        !s.edits_source() || d.networks.contains(&s.network),
         "Choose the network.",
+    );
+    e.check(
+        "ip_url",
+        s.source != WEB
+            || s.ip_url.is_empty()
+            || s.ip_url.starts_with("https://")
+            || s.ip_url.starts_with("http://"),
+        "Enter an http:// or https:// address, or leave it empty.",
     );
     e
 }
@@ -254,19 +276,26 @@ fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
         "use_https".into(),
         flag(p.is_some() || s.url.starts_with("https://")),
     );
-    match existing {
-        None => {
-            out.insert("ip_source".into(), json!("network"));
-            out.insert("ip_network".into(), json!(s.network));
-            out.insert("interface".into(), json!(s.network));
-        }
-        Some(x) if x.by_network() => {
-            out.insert("ip_network".into(), json!(s.network));
-            if x.interface.is_empty() || x.interface == x.network {
-                out.insert("interface".into(), json!(s.network));
-            }
-        }
-        Some(_) => {}
+    if !s.edits_source() {
+        return out;
+    }
+    // The source is written when it changes; a section that never named one
+    // reads as `network`. Each source's own option is written under it, and
+    // the other's is left for a switch back.
+    let was = existing.map(|x| if x.by_network() { NETWORK } else { WEB });
+    let now = if s.by_network() { NETWORK } else { WEB };
+    if was != Some(now) {
+        out.insert("ip_source".into(), json!(now));
+    }
+    match s.by_network() {
+        true => out.insert("ip_network".into(), json!(s.network)),
+        false => out.insert(
+            "ip_url".into(),
+            text(Some(s.ip_url.clone()).filter(|u| !u.is_empty())),
+        ),
+    };
+    if existing.is_none_or(|x| x.interface.is_empty() || x.interface == x.network) {
+        out.insert("interface".into(), json!(s.network));
     }
     out
 }
@@ -483,22 +512,7 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
         )
         .writes("use_ipv6"),
     );
-    fields.push(match s.by_network() {
-        true => Widget::select(
-            "ip_network",
-            "Network",
-            &s.network,
-            std::iter::once(SelectOption::new("", "Choose a network"))
-                .chain(d.networks.iter().map(|n| SelectOption::new(n, n)))
-                .collect(),
-            e.get("ip_network"),
-        )
-        .writes("ip_network"),
-        false => Widget::text(&format!(
-            "The address comes from `ip_source '{}'`, set outside this page. Saving keeps it.",
-            s.source
-        )),
-    });
+    fields.extend(source(d, s, e));
     fields.push(Widget::switch_keyed(
         "enabled",
         "Keep it up to date",
@@ -555,6 +569,83 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
         children,
         ..Default::default()
     }
+}
+
+/// source is where the address comes from, and the network the name follows.
+/// Choosing the source draws the drawer again, so the network names the option
+/// it writes: `ip_network` read for the address, or `interface` whose coming
+/// up starts a check.
+fn source(d: &Ddns, s: &Service, e: &Errors) -> Vec<Widget> {
+    if !s.edits_source() {
+        return vec![Widget::text(&format!(
+            "The address comes from `ip_source '{}'`, set outside this page. Saving keeps it.",
+            s.source
+        ))];
+    }
+    let mut fields = vec![helped(
+        Widget::select(
+            "ip_source",
+            "Address from",
+            if s.by_network() { NETWORK } else { WEB },
+            vec![
+                SelectOption::new(NETWORK, "This router’s connection"),
+                SelectOption::new(WEB, "Ask the internet"),
+            ],
+            "",
+        )
+        .writes("ip_source")
+        .reshapes(),
+        "Behind another router, this router’s own address is a private one that providers refuse. Ask the internet instead.",
+    )];
+    if !s.by_network() {
+        let checker = if s.v6 {
+            "checkipv6.dyndns.com"
+        } else {
+            "checkip.dyndns.com"
+        };
+        fields.push(
+            field(
+                "ip_url",
+                "Checked at",
+                &s.ip_url,
+                "",
+                &format!("Where the router asks for its public address. Empty asks {checker}."),
+                e,
+            )
+            .writes("ip_url"),
+        );
+    }
+    let (key, help) = match s.by_network() {
+        true => (
+            "ip_network",
+            "The connection whose address the name points at.",
+        ),
+        false => (
+            "interface",
+            "The name is checked again whenever this connection comes up.",
+        ),
+    };
+    fields.push(helped(
+        Widget::select(
+            "ip_network",
+            "Network",
+            &s.network,
+            std::iter::once(SelectOption::new("", "Choose a network"))
+                .chain(d.networks.iter().map(|n| SelectOption::new(n, n)))
+                .collect(),
+            e.get("ip_network"),
+        )
+        .writes(key),
+        help,
+    ));
+    fields
+}
+
+fn helped(mut w: Widget, text: &str) -> Widget {
+    if let Widget::Field(Field { help, .. }) = &mut w {
+        *help = text.into();
+    }
+    w
 }
 
 fn when(value: &str, s: &Service, children: Vec<Widget>) -> Widget {
@@ -771,10 +862,10 @@ mod tests {
 
     #[test]
     fn a_save_leaves_an_address_source_set_by_hand() {
-        let web = saved("web", "wan", "wan");
+        let web = saved("script", "wan", "wan");
         let out = resaved(
             &web,
-            "provider=dynv6.com&lookup_host=home.dynv6.net&enabled=1",
+            "provider=dynv6.com&lookup_host=home.dynv6.net&enabled=1&ip_source=web&ip_network=lan",
         );
         for key in ["ip_source", "ip_network", "interface"] {
             assert!(!out.contains_key(key), "{key} written: {out:?}");
@@ -793,6 +884,73 @@ mod tests {
         )
         .get("ip_network")
         .is_empty());
+    }
+
+    #[test]
+    fn a_new_name_can_ask_the_internet_for_its_address() {
+        let out = writes(
+            None,
+            &posted(
+                None,
+                &Form::parse(
+                    "provider=dynv6.com&lookup_host=home.dynv6.net&ip_source=web&ip_network=wan",
+                ),
+            ),
+        );
+        assert_eq!(out["ip_source"], "web");
+        assert_eq!(out["interface"], "wan");
+        assert_eq!(out["ip_url"], Value::Null);
+        assert!(!out.contains_key("ip_network"), "{out:?}");
+        let checker = writes(
+            None,
+            &posted(
+                None,
+                &Form::parse("provider=dynv6.com&lookup_host=h.dynv6.net&ip_source=web&ip_url=https://api.ipify.org&ip_network=wan"),
+            ),
+        );
+        assert_eq!(checker["ip_url"], "https://api.ipify.org");
+    }
+
+    #[test]
+    fn switching_the_source_leaves_the_other_sources_options() {
+        let mut net = saved("", "wan", "wan");
+        net.values.insert("ip_network".into(), json!("wan"));
+        let to_web = resaved(
+            &net,
+            "provider=dynv6.com&lookup_host=home.dynv6.net&ip_source=web&ip_network=wan",
+        );
+        assert_eq!(to_web["ip_source"], "web");
+        assert!(!to_web.contains_key("ip_network"), "{to_web:?}");
+        let mut web = saved("web", "wan", "wan");
+        web.ip_url = "https://api.ipify.org".into();
+        let to_net = resaved(
+            &web,
+            "provider=dynv6.com&lookup_host=home.dynv6.net&ip_source=network&ip_network=wan",
+        );
+        assert_eq!(to_net["ip_source"], "network");
+        assert_eq!(to_net["ip_network"], "wan");
+        assert!(!to_net.contains_key("ip_url"), "{to_net:?}");
+        let kept = resaved(
+            &net,
+            "provider=dynv6.com&lookup_host=home.dynv6.net&ip_network=wan",
+        );
+        assert!(!kept.contains_key("ip_source"), "{kept:?}");
+    }
+
+    #[test]
+    fn choosing_a_source_redraws_the_drawer_with_its_own_fields() {
+        let d = router();
+        let form = Form::parse(
+            "_action=reshape&provider=dynv6.com&lookup_host=a.dynv6.net&ip_source=web&ip_network=wan",
+        );
+        let b = body(&post(&d, NEW, &form));
+        assert!(b.get("commit").is_none());
+        assert!(b.get("notice").is_none());
+        let drawer = b["act"]["drawer"].to_string();
+        assert!(drawer.contains("\"ip_url\""), "{drawer}");
+        assert!(drawer.contains("\"key\":\"interface\""), "{drawer}");
+        let bad = posted(None, &Form::parse("provider=dynv6.com&lookup_host=a.dynv6.net&ip_source=web&ip_url=ftp://x&ip_network=wan"));
+        assert!(!validate(&d, None, &bad).get("ip_url").is_empty());
     }
 
     #[test]

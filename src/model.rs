@@ -74,6 +74,8 @@ pub const CUSTOM: &str = "custom";
 pub const CLOUDFLARE: &str = "cloudflare.com-v4";
 pub const DUCKDNS: &str = "duckdns.org";
 pub const DUCKDNS_SUFFIX: &str = ".duckdns.org";
+pub const NETWORK: &str = "network";
+pub const WEB: &str = "web";
 
 pub fn provider(id: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.id == id)
@@ -108,7 +110,11 @@ pub struct Service {
     pub v6: bool,
     /// `ip_source` as the section holds it; empty is ddns-scripts' `network`.
     pub source: String,
-    /// The network the address is read from: `ip_network`, or what stands for it.
+    /// Where `web` asks for the address; empty is ddns-scripts' own checker.
+    pub ip_url: String,
+    /// The network the name follows: the one the address is read from under
+    /// `network` (`ip_network`), the one whose ifup starts the check under
+    /// `web` (`interface`).
     pub network: String,
     /// `interface` as the section holds it: the network whose ifup starts the
     /// updater.
@@ -168,7 +174,12 @@ impl Service {
             (_, z) => format!("{host}.{z}"),
         };
         let v6 = s.scalar("use_ipv6") == "1";
-        let network = [s.scalar("ip_network"), s.scalar("interface")]
+        let (ip_network, interface) = (s.scalar("ip_network"), s.scalar("interface"));
+        let named = match s.scalar("ip_source").as_str() {
+            "web" => [interface, ip_network],
+            _ => [ip_network, interface],
+        };
+        let network = named
             .into_iter()
             .find(|n| !n.is_empty())
             .unwrap_or_else(|| if v6 { "wan6" } else { "wan" }.into());
@@ -187,6 +198,7 @@ impl Service {
             url,
             v6,
             source: s.scalar("ip_source"),
+            ip_url: s.scalar("ip_url"),
             network,
             interface: s.scalar("interface"),
             values: s
@@ -206,9 +218,16 @@ impl Service {
     }
 
     /// by_network is whether the address is read from one of the router's
-    /// networks, the only source the drawer edits.
+    /// networks.
     pub fn by_network(&self) -> bool {
-        matches!(self.source.as_str(), "" | "network")
+        matches!(self.source.as_str(), "" | NETWORK)
+    }
+
+    /// edits_source is whether the drawer offers the address source: the
+    /// router's network or the internet's answer. A device (`interface`) or a
+    /// script is set by hand and kept as it is.
+    pub fn edits_source(&self) -> bool {
+        self.by_network() || self.source == WEB
     }
 
     pub fn provider_label(&self) -> &str {
