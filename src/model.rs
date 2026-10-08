@@ -77,6 +77,16 @@ pub const CUSTOM: &str = "custom";
 pub const CLOUDFLARE: &str = "cloudflare.com-v4";
 pub const DUCKDNS: &str = "duckdns.org";
 pub const DUCKDNS_SUFFIX: &str = ".duckdns.org";
+/// TIMING are ddns-scripts' timing options, each with what it reads without it.
+pub const TIMING: [(&str, &str); 7] = [
+    ("check_interval", "10"),
+    ("check_unit", "minutes"),
+    ("force_interval", "72"),
+    ("force_unit", "hours"),
+    ("retry_interval", "60"),
+    ("retry_unit", "seconds"),
+    ("retry_max_count", "0"),
+];
 pub const NETWORK: &str = "network";
 pub const WEB: &str = "web";
 
@@ -133,6 +143,9 @@ pub struct Service {
     /// `interface` as the section holds it: the network whose ifup starts the
     /// updater.
     pub interface: String,
+    /// The [`TIMING`] options as the section holds them; one it does not hold
+    /// is absent.
+    pub timing: BTreeMap<String, String>,
     /// The section's options as uci holds them, for the drawer's preview.
     pub values: Map<String, Value>,
     pub live: Option<Live>,
@@ -246,6 +259,11 @@ impl Service {
             ip_url: s.scalar("ip_url"),
             network,
             interface: s.scalar("interface"),
+            timing: TIMING
+                .iter()
+                .map(|(key, _)| (key.to_string(), s.scalar(key)))
+                .filter(|(_, value)| !value.is_empty())
+                .collect(),
             values: s
                 .entries()
                 .filter(|(key, _)| !key.starts_with('.'))

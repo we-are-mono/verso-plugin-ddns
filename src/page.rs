@@ -18,7 +18,7 @@ use verso_plugin::{
 
 use crate::model::{
     provider, Ddns, Service, User, CLOUDFLARE, CONFIG, CUSTOM, DUCKDNS, DUCKDNS_SUFFIX, NETWORK,
-    PROVIDERS, WEB,
+    PROVIDERS, TIMING, WEB,
 };
 
 const HEADING: &str = "Dynamic DNS";
@@ -159,6 +159,11 @@ fn posted(existing: Option<&Service>, f: &Form) -> Service {
             _ => f.get("ip_network"),
         },
         interface: existing.map(|s| s.interface.clone()).unwrap_or_default(),
+        timing: TIMING
+            .iter()
+            .map(|(key, _)| (key.to_string(), trimmed(key)))
+            .filter(|(_, value)| !value.is_empty())
+            .collect(),
         values: Map::new(),
         live: None,
     }
@@ -248,6 +253,24 @@ fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
             || s.ip_url.starts_with("http://"),
         "Enter an http:// or https:// address, or leave it empty.",
     );
+    for (key, _) in TIMING {
+        let value = s.timing.get(key).map(String::as_str).unwrap_or("");
+        let (field, ok) = match key.strip_suffix("_unit") {
+            Some(base) => (
+                format!("{base}_interval"),
+                value.is_empty() || UNITS.contains(&value),
+            ),
+            None => (
+                key.to_string(),
+                value.is_empty() || value.parse::<u32>().is_ok(),
+            ),
+        };
+        e.check(
+            &field,
+            ok,
+            "Enter a whole number of seconds, minutes, hours or days.",
+        );
+    }
     e
 }
 
@@ -301,6 +324,16 @@ fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
         "use_https".into(),
         flag(p.is_some() || s.url.starts_with("https://")),
     );
+    // A timing option is written when it differs from what the section reads
+    // as now, so a save that changed none writes none, and a default is never
+    // spelled out for its own sake.
+    for (key, default) in TIMING {
+        let saved = existing.and_then(|x| x.timing.get(key)).map(String::as_str);
+        let posted = s.timing.get(key).map(String::as_str).unwrap_or(default);
+        if posted != saved.unwrap_or(default) {
+            out.insert(key.into(), json!(posted));
+        }
+    }
     if !s.edits_source() {
         return out;
     }
@@ -597,9 +630,10 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
         "enabled",
         "Keep it up to date",
         "enabled",
-        "Checks the address every 10 minutes and updates the name when it changes.",
+        "Checks the address on the timing below and updates the name when it changes.",
         s.enabled,
     ));
+    fields.push(timing(s, e));
     // The section as saving would leave it, the password standing masked.
     let mut preview = existing.map(|x| x.values.clone()).unwrap_or_default();
     for (key, value) in writes(existing, s) {
@@ -719,6 +753,64 @@ fn source(d: &Ddns, s: &Service, e: &Errors) -> Vec<Widget> {
         help,
     ));
     fields
+}
+
+/// UNITS are what ddns-scripts counts an interval in.
+const UNITS: [&str; 4] = ["seconds", "minutes", "hours", "days"];
+
+/// timing is how often the updater checks, sends anyway and retries, and when
+/// it gives up: each a number and its unit, drawn as ddns-scripts reads them.
+fn timing(s: &Service, e: &Errors) -> Widget {
+    let value = |key: &str| {
+        let default = TIMING
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, d)| *d)
+            .unwrap_or("");
+        s.timing.get(key).cloned().unwrap_or_else(|| default.into())
+    };
+    let units = || UNITS.iter().map(|u| SelectOption::new(u, u)).collect();
+    // A number and its unit side by side, each labelled: the shell fuses a
+    // group under one label only around a joining word, and none reads
+    // between "10" and "minutes".
+    let pair = |base: &str, label: &str, help: &str| {
+        let (interval, unit) = (format!("{base}_interval"), format!("{base}_unit"));
+        Widget::form_grid(
+            2,
+            vec![
+                field(&interval, label, &value(&interval), "", help, e).writes(&interval),
+                Widget::select(&unit, "Unit", &value(&unit), units(), "").writes(&unit),
+            ],
+        )
+    };
+    Widget::section(
+        "Timing",
+        "",
+        vec![
+            pair(
+                "check",
+                "Check every",
+                "How often the router compares its address with the name’s. Under 5 minutes counts as 5.",
+            ),
+            pair(
+                "force",
+                "Send anyway every",
+                "An update goes out this often even when nothing changed, so the provider keeps the name. 0 sends once and stops.",
+            ),
+            pair("retry", "Retry after", "How long to wait after a failed update."),
+            field(
+                "retry_max_count",
+                "Give up after",
+                &value("retry_max_count"),
+                "",
+                "Failed tries before the updater stops. 0 keeps trying.",
+                e,
+            )
+            .writes("retry_max_count")
+            .counted_in("tries"),
+        ],
+    )
+    .ruled()
 }
 
 fn helped(mut w: Widget, text: &str) -> Widget {
@@ -1165,6 +1257,74 @@ mod tests {
         assert!(body(&post(&d, "", &Form::parse("update=gone")))
             .get("commands")
             .is_none());
+    }
+
+    const NAME: &str = "provider=dynv6.com&lookup_host=home.dynv6.net&ip_network=wan";
+
+    #[test]
+    fn timing_shows_ddns_scripts_defaults_and_an_unchanged_save_writes_none() {
+        let d = router();
+        let s = saved("", "wan", "wan");
+        let drawer = serde_json::to_string(&drawer(&d, Some(&s), &s, &Errors::default())).unwrap();
+        for (name, value) in [
+            ("check_interval", "10"),
+            ("force_interval", "72"),
+            ("retry_interval", "60"),
+            ("retry_max_count", "0"),
+        ] {
+            assert!(
+                drawer.contains(&format!("\"name\":\"{name}\",\"label\""))
+                    && drawer.contains(&format!("\"value\":\"{value}\"")),
+                "{name}={value} not drawn"
+            );
+        }
+        let out = resaved(
+            &s,
+            &format!("{NAME}&check_interval=10&check_unit=minutes&force_interval=72&force_unit=hours&retry_interval=60&retry_unit=seconds&retry_max_count=0"),
+        );
+        for (key, _) in TIMING {
+            assert!(!out.contains_key(key), "{key} written: {out:?}");
+        }
+    }
+
+    #[test]
+    fn timing_writes_only_what_changed_and_keeps_what_was_set() {
+        let mut s = saved("", "wan", "wan");
+        s.timing.insert("force_unit".into(), "days".into());
+        s.timing.insert("force_interval".into(), "7".into());
+        let out = resaved(
+            &s,
+            &format!("{NAME}&check_interval=30&check_unit=minutes&force_interval=7&force_unit=days&retry_interval=60&retry_unit=seconds&retry_max_count=5"),
+        );
+        assert_eq!(out["check_interval"], "30");
+        assert_eq!(out["retry_max_count"], "5");
+        for key in [
+            "check_unit",
+            "force_interval",
+            "force_unit",
+            "retry_interval",
+            "retry_unit",
+        ] {
+            assert!(!out.contains_key(key), "{key} written: {out:?}");
+        }
+    }
+
+    #[test]
+    fn timing_takes_whole_numbers_and_known_units() {
+        let d = router();
+        let s = saved("", "wan", "wan");
+        for (bad, key) in [
+            ("check_interval=ten&check_unit=minutes", "check_interval"),
+            ("check_interval=-1&check_unit=minutes", "check_interval"),
+            ("check_interval=10&check_unit=weeks", "check_interval"),
+            ("retry_max_count=x", "retry_max_count"),
+        ] {
+            let posted = posted(Some(&s), &Form::parse(&format!("{NAME}&{bad}")));
+            assert!(
+                !validate(&d, Some(&s), &posted).get(key).is_empty(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
