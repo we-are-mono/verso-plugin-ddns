@@ -155,7 +155,7 @@ impl Ddns {
 }
 
 impl Service {
-    fn of(s: &Section, state: Option<&Value>) -> Service {
+    pub fn of(s: &Section, state: Option<&Value>) -> Service {
         let name = s.name();
         let domain = s.scalar("domain");
         let (host, zone) = domain.split_once('@').unwrap_or((&domain, ""));

@@ -9,13 +9,14 @@
 //! reads what each updater last did from its run folder. The plugin reaches
 //! nothing itself.
 
-use verso_plugin::{serve, Envelope, Form, Request};
+use verso_plugin::{serve_described, Envelope, Form, Request};
 
+mod describe;
 mod model;
 mod page;
 
 fn main() {
-    serve("ddns", get, post);
+    serve_described("ddns", get, post, describe::describe);
 }
 
 fn get(request: &Request) -> Envelope {
