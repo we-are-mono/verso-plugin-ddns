@@ -10,8 +10,9 @@ ID          := ddns
 NAME        := verso-plugin-$(ID)
 DESCRIPTION := Verso Dynamic DNS — keep a name pointing at the router
 # ddns-scripts runs the updates. Its services package carries DuckDNS, deSEC and
-# dynv6; Cloudflare and No-IP each come in a package of their own.
-DEPENDS     := verso ddns-scripts ddns-scripts-cloudflare ddns-scripts-noip
+# dynv6; Cloudflare and No-IP each come in a package of their own. Verso 0.3.0 is
+# the first whose helper reads and restarts the updaters (ddnsState, ddnsUpdate).
+DEPENDS     := verso>=0.3.0 ddns-scripts ddns-scripts-cloudflare ddns-scripts-noip
 
 CARGO    ?= $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,cargo)
 BUILDDIR := build

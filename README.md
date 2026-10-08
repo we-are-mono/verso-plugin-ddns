@@ -26,8 +26,8 @@ apk update
 apk add verso-plugin-ddns
 ```
 
-The package depends on `verso`, `ddns-scripts`, `ddns-scripts-cloudflare` and
-`ddns-scripts-noip`.
+The package depends on `verso` 0.3.0 or newer, `ddns-scripts`,
+`ddns-scripts-cloudflare` and `ddns-scripts-noip`.
 
 ## Build
 
