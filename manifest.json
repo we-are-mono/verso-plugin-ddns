@@ -1,0 +1,19 @@
+{
+  "id": "ddns",
+  "name": "Dynamic DNS",
+  "socket": "/var/run/verso/ddns.sock",
+  "schema_version": 1,
+  "nav": [
+    { "section": "Network", "label": "Dynamic DNS", "path": "/", "icon": "globe" }
+  ],
+  "acl": {
+    "read": [
+      { "scope": "uci", "object": "ddns", "function": "read" },
+      { "scope": "uci", "object": "network", "function": "read" },
+      { "scope": "ubus", "object": "verso", "function": "ddnsState" }
+    ],
+    "write": [
+      { "scope": "uci", "object": "ddns", "function": "write" }
+    ]
+  }
+}

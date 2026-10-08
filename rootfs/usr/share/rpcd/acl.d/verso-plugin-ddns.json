@@ -1,0 +1,12 @@
+{
+	"verso-plugin-ddns": {
+		"description": "Session grants for Verso's Dynamic DNS page: ddns-scripts' own config; the network config, for the interfaces an update can follow; and the helper's read of what each updater last did. The shell holds the operator's session and performs these on the plugin's behalf (ADR-007), so this file is what makes the manifest's declared acl grantable at rpcd — the plugin itself holds no session and no privilege.",
+		"read": {
+			"uci": [ "ddns", "network" ],
+			"ubus": { "verso": [ "ddnsState" ] }
+		},
+		"write": {
+			"uci": [ "ddns" ]
+		}
+	}
+}

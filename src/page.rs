@@ -1,0 +1,834 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-FileCopyrightText: 2026 Mono Technologies Inc.
+
+//! The Dynamic DNS page: one row per `config service`, each opened to its
+//! drawer, and the heading's act opening a blank one.
+//!
+//! The drawer asks for a provider, a hostname and its secret, and writes what
+//! ddns-scripts reads for that provider. It always writes `lookup_host`: an
+//! updater that finds none sets it and runs `uci commit ddns` itself.
+
+use verso_plugin::{
+    json, uci_text, ColumnWidth, CommitOp, Envelope, Errors, Field, Form, HeadingAct, Map,
+    RowDrawer, SelectOption, Table, TableCell, TableChip, TableColumn, TableRow, TableRowAct, Tone,
+    Value, Widget,
+};
+
+use crate::model::{
+    provider, Ddns, Service, User, CLOUDFLARE, CONFIG, CUSTOM, DUCKDNS, DUCKDNS_SUFFIX, PROVIDERS,
+};
+
+const HEADING: &str = "Dynamic DNS";
+const EMPTY: &str = "No dynamic DNS yet. Add a name, and the router keeps it pointing at \
+     its own address whenever the connection gets a new one.";
+pub const REFUSED: &str = "Some values are missing, so nothing was saved. They’re marked below.";
+const KEEP_HELP: &str = "Leave empty to keep the saved one.";
+const DASH: &str = "—";
+const MASK: &str = "••••••••";
+
+/// OPEN is the query key naming the section whose drawer is open; NEW opens a
+/// blank one.
+pub const OPEN: &str = "open";
+pub const NEW: &str = "new";
+const DELETE: &str = "delete";
+
+fn href(name: &str) -> String {
+    format!("/plugins/ddns/?{OPEN}={name}")
+}
+
+/// page is the listing, with `open`'s drawer in front of it.
+pub fn page(d: &Ddns, open: &str) -> Envelope {
+    let drawer = match open {
+        NEW => Some(drawer(d, None, &blank(d), &Errors::default())),
+        name => d
+            .service(name)
+            .map(|s| drawer(d, Some(s), s, &Errors::default())),
+    };
+    listing(d, open, drawer)
+}
+
+/// post answers the open drawer: its save, or its confirmed delete.
+pub fn post(d: &Ddns, open: &str, form: &Form) -> Envelope {
+    let existing = d.service(open);
+    if open != NEW && existing.is_none() {
+        return listing(d, "", None).with_notice(
+            Tone::Danger,
+            "This name is no longer set up, so nothing was saved.",
+        );
+    }
+    if let (Some(s), "1") = (existing, form.get(DELETE).as_str()) {
+        return listing(d, "", None).with_commit(vec![CommitOp {
+            config: CONFIG.into(),
+            section: s.name.clone(),
+            section_type: String::new(),
+            delete: true,
+            values: Value::Null,
+        }]);
+    }
+    let posted = posted(existing, form);
+    let errors = validate(d, existing, &posted);
+    let answer = listing(d, open, Some(drawer(d, existing, &posted, &errors)));
+    if !errors.is_empty() {
+        return answer.with_notice(Tone::Danger, REFUSED);
+    }
+    answer.with_commit(vec![CommitOp {
+        config: CONFIG.into(),
+        section: match existing {
+            Some(s) => s.name.clone(),
+            None => section_name(&posted),
+        },
+        section_type: if existing.is_some() {
+            String::new()
+        } else {
+            "service".into()
+        },
+        delete: false,
+        values: Value::Object(writes(existing, &posted)),
+    }])
+}
+
+fn blank(d: &Ddns) -> Service {
+    Service {
+        enabled: true,
+        provider: PROVIDERS[0].id.into(),
+        network: if d.networks.iter().any(|n| n == "wan") {
+            "wan".into()
+        } else {
+            String::new()
+        },
+        ..Default::default()
+    }
+}
+
+fn posted(existing: Option<&Service>, f: &Form) -> Service {
+    let trimmed = |key: &str| f.get(key).trim().to_string();
+    Service {
+        name: existing.map(|s| s.name.clone()).unwrap_or_default(),
+        enabled: !f.get("enabled").is_empty(),
+        provider: f.get("provider"),
+        hostname: trimmed("lookup_host").to_lowercase(),
+        zone: trimmed("zone").to_lowercase(),
+        username: trimmed("username"),
+        password: f.get("password"),
+        saved_password: existing.is_some_and(|s| s.saved_password),
+        url: trimmed("update_url"),
+        v6: f.get("use_ipv6") == "1",
+        // Options the drawer does not show carry over from the section.
+        source: existing.map(|s| s.source.clone()).unwrap_or_default(),
+        network: match existing {
+            Some(s) if !s.by_network() => s.network.clone(),
+            _ => f.get("ip_network"),
+        },
+        interface: existing.map(|s| s.interface.clone()).unwrap_or_default(),
+        values: Map::new(),
+        live: None,
+    }
+}
+
+/// section_name is a new section's name, from its hostname and family: the
+/// updater names its files after it, and a hotplug event starts it by it.
+fn section_name(s: &Service) -> String {
+    let base: String = s
+        .hostname
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if s.v6 {
+        format!("{base}_v6")
+    } else {
+        base
+    }
+}
+
+fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
+    let mut e = Errors::default();
+    let custom = s.provider == CUSTOM;
+    e.check(
+        "provider",
+        custom || provider(&s.provider).is_some(),
+        "Choose a provider.",
+    );
+    e.check(
+        "lookup_host",
+        !s.hostname.is_empty(),
+        "Enter the name to keep up to date.",
+    );
+    if existing.is_none() && !s.hostname.is_empty() {
+        e.check(
+            "lookup_host",
+            d.service(&section_name(s)).is_none(),
+            "This name is already kept up to date over this address family.",
+        );
+    }
+    match s.provider.as_str() {
+        CLOUDFLARE => {
+            e.check("zone", !s.zone.is_empty(), "Enter the zone the name is in.");
+            e.check(
+                "lookup_host",
+                s.zone.is_empty()
+                    || s.hostname == s.zone
+                    || s.hostname.ends_with(&format!(".{}", s.zone)),
+                "The name has to be in the zone.",
+            );
+        }
+        DUCKDNS => e.check(
+            "lookup_host",
+            s.hostname.is_empty() || s.hostname.ends_with(DUCKDNS_SUFFIX),
+            "A DuckDNS name ends in .duckdns.org.",
+        ),
+        CUSTOM => e.check(
+            "update_url",
+            (s.url.starts_with("https://") || s.url.starts_with("http://"))
+                && s.url.contains("[IP]"),
+            "Enter the provider’s update URL, with [IP] where the address goes.",
+        ),
+        _ => {}
+    }
+    if let Some(User::Typed(label)) = provider(&s.provider).map(|p| &p.user) {
+        e.check(
+            "username",
+            !s.username.is_empty(),
+            &format!("Enter the {}.", label.to_lowercase()),
+        );
+    }
+    e.check(
+        "password",
+        custom || s.saved_password || !s.password.is_empty(),
+        "Enter the provider’s secret.",
+    );
+    e.check(
+        "ip_network",
+        !s.by_network() || d.networks.contains(&s.network),
+        "Choose the network.",
+    );
+    e
+}
+
+/// writes is the section as ddns-scripts reads it for this provider. Options
+/// another provider would use are cleared, and an empty password keeps the
+/// saved one. What the drawer does not show stays as the section has it: an
+/// address source set by hand, an `interface` apart from the network, and a
+/// Cloudflare sign-in by e-mail rather than "Bearer".
+fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
+    let p = provider(&s.provider);
+    let domain = match s.provider.as_str() {
+        CLOUDFLARE => {
+            let host = s
+                .hostname
+                .strip_suffix(&s.zone)
+                .unwrap_or("")
+                .trim_end_matches('.');
+            format!("{host}@{}", s.zone)
+        }
+        DUCKDNS => s.hostname.trim_end_matches(DUCKDNS_SUFFIX).into(),
+        _ => s.hostname.clone(),
+    };
+    let signed_in = existing.is_some_and(|x| x.provider == s.provider && !x.username.is_empty());
+    // None leaves `username` as the section has it.
+    let username = match p.map(|p| &p.user) {
+        Some(User::None) => Some(None),
+        Some(User::Fixed(_)) if signed_in => None,
+        Some(User::Fixed(word)) => Some(Some(word.to_string())),
+        Some(User::Hostname) => Some(Some(s.hostname.clone())),
+        Some(User::Typed(_)) | None => Some(Some(s.username.clone()).filter(|u| !u.is_empty())),
+    };
+    let text = |v: Option<String>| v.map(Value::String).unwrap_or(Value::Null);
+    let flag = |on: bool| json!(if on { "1" } else { "0" });
+    let mut out = Map::new();
+    out.insert("enabled".into(), flag(s.enabled));
+    out.insert("service_name".into(), text(p.map(|p| p.id.to_string())));
+    out.insert(
+        "update_url".into(),
+        text(p.is_none().then(|| s.url.clone())),
+    );
+    out.insert("domain".into(), json!(domain));
+    out.insert("lookup_host".into(), json!(s.hostname));
+    if let Some(username) = username {
+        out.insert("username".into(), text(username));
+    }
+    if !s.password.is_empty() {
+        out.insert("password".into(), json!(s.password));
+    }
+    out.insert("use_ipv6".into(), flag(s.v6));
+    out.insert(
+        "use_https".into(),
+        flag(p.is_some() || s.url.starts_with("https://")),
+    );
+    match existing {
+        None => {
+            out.insert("ip_source".into(), json!("network"));
+            out.insert("ip_network".into(), json!(s.network));
+            out.insert("interface".into(), json!(s.network));
+        }
+        Some(x) if x.by_network() => {
+            out.insert("ip_network".into(), json!(s.network));
+            if x.interface.is_empty() || x.interface == x.network {
+                out.insert("interface".into(), json!(s.network));
+            }
+        }
+        Some(_) => {}
+    }
+    out
+}
+
+fn listing(d: &Ddns, open: &str, drawer: Option<RowDrawer>) -> Envelope {
+    let mut drawer = drawer;
+    let blank = if open == NEW { drawer.take() } else { None };
+    let rows = d
+        .services
+        .iter()
+        .map(|s| row(d, s, if s.name == open { drawer.take() } else { None }))
+        .collect();
+    Envelope::page(
+        HEADING,
+        Widget::Table(Table {
+            dense: true,
+            columns: columns(),
+            rows,
+            empty_text: EMPTY.into(),
+            ..Default::default()
+        }),
+    )
+    .with_width("wide")
+    .with_tone("neutral")
+    .with_act(HeadingAct {
+        label: "Add name".into(),
+        href: href(NEW),
+        opens_panel: true,
+        drawer: blank,
+        ..Default::default()
+    })
+}
+
+fn columns() -> Vec<TableColumn> {
+    [
+        ("Name", "name", ColumnWidth::Long),
+        ("Provider", "text", ColumnWidth::Name),
+        ("Network", "entity", ColumnWidth::Word),
+        ("Points at", "mono", ColumnWidth::Address),
+        ("State", "status", ColumnWidth::Word),
+        ("Last update", "text", ColumnWidth::Grow),
+        ("", "actions", ColumnWidth::Short),
+    ]
+    .into_iter()
+    .map(|(label, kind, width)| TableColumn {
+        label: label.into(),
+        kind: kind.into(),
+        width,
+    })
+    .collect()
+}
+
+fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
+    let door = href(&s.name);
+    let (state, variant) = state(d, s);
+    let live = s.live.clone().unwrap_or_default();
+    let cell = |text: &str| TableCell {
+        text: text.into(),
+        ..Default::default()
+    };
+    TableRow {
+        id: s.name.clone(),
+        muted: !s.enabled,
+        cells: vec![
+            TableCell {
+                text: s.hostname.clone(),
+                href: door.clone(),
+                ..Default::default()
+            },
+            cell(&format!(
+                "{} · {}",
+                s.provider_label(),
+                if s.v6 { "IPv6" } else { "IPv4" }
+            )),
+            TableCell {
+                chips: vec![TableChip {
+                    icon: "network".into(),
+                    label: s.network.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            match live.address.as_str() {
+                "" => TableCell {
+                    text: DASH.into(),
+                    muted: true,
+                    ..Default::default()
+                },
+                a => TableCell {
+                    text: a.into(),
+                    emphasis: true,
+                    ..Default::default()
+                },
+            },
+            TableCell {
+                text: state.into(),
+                variant: variant.into(),
+                ..Default::default()
+            },
+            match live.updated {
+                Some(secs) => cell(&ago(secs)),
+                None => TableCell {
+                    text: DASH.into(),
+                    muted: true,
+                    ..Default::default()
+                },
+            },
+            TableCell {
+                actions: vec![TableRowAct {
+                    icon: "square-pen".into(),
+                    title: "Edit".into(),
+                    href: door.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        drawer,
+        panel: door,
+        ..Default::default()
+    }
+}
+
+/// state is a service's state in a word and its tone. Switched off is the
+/// resting state; switched on with no updater running is a failure, since
+/// ddns-scripts' updater exits once it gives up.
+fn state(d: &Ddns, s: &Service) -> (&'static str, &'static str) {
+    match (s.enabled, d.known, &s.live) {
+        (false, _, _) => ("off", ""),
+        (true, false, _) => ("unknown", ""),
+        (true, true, Some(l)) if l.running => ("running", "success"),
+        (true, true, _) => ("not running", "danger"),
+    }
+}
+
+/// ago is how long since, the way a person says it.
+fn ago(secs: u64) -> String {
+    match (secs / 86400, secs / 3600, secs / 60) {
+        (0, 0, 0) => "just now".into(),
+        (0, 0, m) => format!("{m} min ago"),
+        (0, h, _) => format!("{h} h ago"),
+        (days, _, _) => format!("{days} d ago"),
+    }
+}
+
+fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowDrawer {
+    let providers = PROVIDERS
+        .iter()
+        .map(|p| SelectOption::new(p.id, p.label))
+        .chain([SelectOption::new(CUSTOM, "Another provider (update URL)")])
+        .collect();
+    let mut fields = vec![
+        Widget::select(
+            "provider",
+            "Provider",
+            &s.provider,
+            providers,
+            e.get("provider"),
+        )
+        .writes("service_name"),
+        field(
+            "lookup_host",
+            "Name",
+            &s.hostname,
+            "fqdn",
+            "The full name, such as home.example.com.",
+            e,
+        ),
+    ];
+    for p in &PROVIDERS {
+        let mut children = Vec::new();
+        if p.id == CLOUDFLARE {
+            children.push(field(
+                "zone",
+                "Zone",
+                &s.zone,
+                "fqdn",
+                "The domain the name is in, as Cloudflare lists it.",
+                e,
+            ));
+        }
+        if let User::Typed(label) = p.user {
+            children.push(field("username", label, &s.username, "", "", e));
+        }
+        children.push(secret(p.secret, s, e));
+        fields.push(when(p.id, s, children));
+    }
+    fields.push(when(
+        CUSTOM,
+        s,
+        vec![
+            field(
+                "update_url",
+                "Update URL",
+                &s.url,
+                "",
+                "The address the router calls to update the name. [IP], [DOMAIN], [USERNAME] and [PASSWORD] are filled in.",
+                e,
+            ),
+            field("username", "Username", &s.username, "", "", e),
+            secret("Password", s, e),
+        ],
+    ));
+    fields.push(
+        Widget::select(
+            "use_ipv6",
+            "Address",
+            if s.v6 { "1" } else { "0" },
+            vec![
+                SelectOption::new("0", "IPv4"),
+                SelectOption::new("1", "IPv6"),
+            ],
+            "",
+        )
+        .writes("use_ipv6"),
+    );
+    fields.push(match s.by_network() {
+        true => Widget::select(
+            "ip_network",
+            "Network",
+            &s.network,
+            std::iter::once(SelectOption::new("", "Choose a network"))
+                .chain(d.networks.iter().map(|n| SelectOption::new(n, n)))
+                .collect(),
+            e.get("ip_network"),
+        )
+        .writes("ip_network"),
+        false => Widget::text(&format!(
+            "The address comes from `ip_source '{}'`, set outside this page. Saving keeps it.",
+            s.source
+        )),
+    });
+    fields.push(Widget::switch_keyed(
+        "enabled",
+        "Keep it up to date",
+        "enabled",
+        "Checks the address every 10 minutes and updates the name when it changes.",
+        s.enabled,
+    ));
+    // The section as saving would leave it, the password standing masked.
+    let mut preview = existing.map(|x| x.values.clone()).unwrap_or_default();
+    for (key, value) in writes(existing, s) {
+        match value {
+            Value::Null => preview.remove(&key),
+            value => preview.insert(key, value),
+        };
+    }
+    if s.saved_password || preview.contains_key("password") {
+        preview.insert("password".into(), json!(MASK));
+    }
+    fields.push(Widget::config_preview(
+        "/etc/config/ddns",
+        &uci_text(
+            "service",
+            existing.map(|x| x.name.as_str()).unwrap_or(""),
+            &preview,
+        ),
+    ));
+    let mut children = vec![Widget::form("Save", fields)];
+    if existing.is_some() {
+        children.push(Widget::Form {
+            style: String::new(),
+            submit: String::new(),
+            error: String::new(),
+            note: String::new(),
+            target: String::new(),
+            fields: vec![
+                Widget::hidden(DELETE, "1"),
+                Widget::Confirm {
+                    trigger: "Remove".into(),
+                    title: String::new(),
+                    message: "The router stops updating this name once you apply. The name keeps the last address it was given.".into(),
+                    confirm: "Remove".into(),
+                    cancel: String::new(),
+                },
+            ],
+        });
+    }
+    RowDrawer {
+        title: match existing {
+            Some(x) => x.hostname.clone(),
+            None => "New name".into(),
+        },
+        closed: "/plugins/ddns/".into(),
+        open: true,
+        children,
+        ..Default::default()
+    }
+}
+
+fn when(value: &str, s: &Service, children: Vec<Widget>) -> Widget {
+    Widget::When {
+        name: "provider".into(),
+        value: value.into(),
+        active: s.provider == value,
+        children,
+    }
+}
+
+fn field(name: &str, label: &str, value: &str, datatype: &str, help: &str, e: &Errors) -> Widget {
+    Widget::Field(Field {
+        name: name.into(),
+        label: label.into(),
+        kind: "text".into(),
+        value: value.into(),
+        datatype: datatype.into(),
+        help: help.into(),
+        error: e.get(name).into(),
+        ..Default::default()
+    })
+}
+
+/// secret is the provider's password or token, never read back onto the page.
+fn secret(label: &str, s: &Service, e: &Errors) -> Widget {
+    Widget::Field(Field {
+        name: "password".into(),
+        label: label.into(),
+        kind: "password".into(),
+        key: "password".into(),
+        help: if s.saved_password {
+            KEEP_HELP.into()
+        } else {
+            String::new()
+        },
+        error: e.get("password").into(),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verso_plugin::{Request, Snapshot, Ubus};
+
+    fn request(snapshot: Value, state: Value) -> Request {
+        Request {
+            path: "/".into(),
+            query: Form::default(),
+            snapshot: Snapshot::from_value(snapshot),
+            ubus: Ubus::from_value(state),
+        }
+    }
+
+    fn router() -> Ddns {
+        Ddns::read(&request(
+            json!({
+                "network": {
+                    "loopback": {".type": "interface", ".name": "loopback", ".index": 0},
+                    "wan": {".type": "interface", ".name": "wan", ".index": 1},
+                    "wan6": {".type": "interface", ".name": "wan6", ".index": 2}
+                },
+                "ddns": {
+                    "global": {".type": "ddns", ".name": "global", ".index": 0},
+                    "myddns_ipv4": {".type": "service", ".name": "myddns_ipv4", ".index": 1,
+                        "service_name": "dyndns.org", "domain": "yourhost.example.com"},
+                    "home": {".type": "service", ".name": "home", ".index": 2, "enabled": "1",
+                        "service_name": "cloudflare.com-v4", "domain": "home@example.com",
+                        "username": "Bearer", "password": "s3cret", "ip_network": "wan"}
+                }
+            }),
+            json!({"ddnsState": {"services": {"home": {"address": "203.0.113.7", "running": true, "updated": 7200}}}}),
+        ))
+    }
+
+    fn body(e: &Envelope) -> Value {
+        serde_json::to_value(e).unwrap()
+    }
+
+    #[test]
+    fn a_service_reads_out_on_one_row_and_samples_stay_out() {
+        let d = router();
+        let b = body(&page(&d, ""));
+        let rows = b["widget"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{b}");
+        let cells = &rows[0]["cells"];
+        assert_eq!(cells[0]["text"], "home.example.com");
+        assert_eq!(cells[1]["text"], "Cloudflare · IPv4");
+        assert_eq!(cells[2]["chips"][0]["label"], "wan");
+        assert_eq!(cells[3]["text"], "203.0.113.7");
+        assert_eq!(cells[4]["text"], "running");
+        assert_eq!(cells[5]["text"], "2 h ago");
+        assert!(!b.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn a_new_cloudflare_name_writes_what_ddns_scripts_reads() {
+        let d = router();
+        let form = Form::parse(
+            "provider=cloudflare.com-v4&lookup_host=nas.lab.example.com&zone=example.com&password=tok&use_ipv6=1&ip_network=wan6&enabled=1",
+        );
+        let b = body(&post(&d, NEW, &form));
+        let op = &b["commit"][0];
+        assert_eq!(op["section"], "nas_lab_example_com_v6");
+        assert_eq!(op["type"], "service");
+        assert_eq!(op["values"]["domain"], "nas.lab@example.com");
+        assert_eq!(op["values"]["lookup_host"], "nas.lab.example.com");
+        assert_eq!(op["values"]["username"], "Bearer");
+        assert_eq!(op["values"]["password"], "tok");
+        assert_eq!(op["values"]["use_ipv6"], "1");
+        assert_eq!(op["values"]["use_https"], "1");
+        assert_eq!(op["values"]["update_url"], Value::Null);
+    }
+
+    #[test]
+    fn duckdns_and_desec_spell_their_own_names() {
+        let d = router();
+        let duck = writes(
+            None,
+            &posted(
+                None,
+                &Form::parse("provider=duckdns.org&lookup_host=myhome.duckdns.org&password=t"),
+            ),
+        );
+        assert_eq!(duck["domain"], "myhome");
+        assert_eq!(duck["username"], Value::Null);
+        let desec = writes(
+            None,
+            &posted(
+                None,
+                &Form::parse("provider=desec.io&lookup_host=me.dedyn.io&password=t"),
+            ),
+        );
+        assert_eq!(desec["username"], "me.dedyn.io");
+        assert!(validate(
+            &d,
+            None,
+            &posted(
+                None,
+                &Form::parse(
+                    "provider=duckdns.org&lookup_host=x.example.com&password=t&ip_network=wan"
+                )
+            )
+        )
+        .get("lookup_host")
+        .contains("duckdns"));
+    }
+
+    #[test]
+    fn an_edit_keeps_the_saved_secret_and_a_refusal_saves_nothing() {
+        let d = router();
+        let kept = body(&post(&d, "home", &Form::parse(
+            "provider=cloudflare.com-v4&lookup_host=home.example.com&zone=example.com&ip_network=wan&enabled=1",
+        )));
+        assert_eq!(kept["commit"][0]["section"], "home");
+        assert!(kept["commit"][0]["values"].get("password").is_none());
+        let refused = body(&post(
+            &d,
+            NEW,
+            &Form::parse("provider=no-ip.com&lookup_host=a.ddns.net&ip_network=wan"),
+        ));
+        assert!(refused.get("commit").is_none());
+        assert_eq!(refused["notice"]["text"], REFUSED);
+    }
+
+    #[test]
+    fn a_custom_url_needs_the_ip_placeholder_and_follows_its_scheme() {
+        let d = router();
+        let bad = posted(
+            None,
+            &Form::parse(
+                "provider=custom&lookup_host=a.example.org&update_url=https://x/&ip_network=wan",
+            ),
+        );
+        assert!(!validate(&d, None, &bad).get("update_url").is_empty());
+        let plain = writes(
+            None,
+            &posted(
+                None,
+                &Form::parse(
+                    "provider=custom&lookup_host=a.example.org&update_url=http://x/?ip=[IP]",
+                ),
+            ),
+        );
+        assert_eq!(plain["service_name"], Value::Null);
+        assert_eq!(plain["use_https"], "0");
+    }
+
+    #[test]
+    fn a_confirmed_remove_deletes_the_section() {
+        let b = body(&post(&router(), "home", &Form::parse("delete=1")));
+        assert_eq!(b["commit"][0]["delete"], true);
+        assert_eq!(b["commit"][0]["section"], "home");
+    }
+
+    fn saved(source: &str, network: &str, interface: &str) -> Service {
+        Service {
+            name: "home".into(),
+            enabled: true,
+            provider: "dynv6.com".into(),
+            hostname: "home.dynv6.net".into(),
+            saved_password: true,
+            source: source.into(),
+            network: network.into(),
+            interface: interface.into(),
+            ..Default::default()
+        }
+    }
+
+    fn resaved(existing: &Service, form: &str) -> Map<String, Value> {
+        writes(Some(existing), &posted(Some(existing), &Form::parse(form)))
+    }
+
+    #[test]
+    fn a_save_leaves_an_address_source_set_by_hand() {
+        let web = saved("web", "wan", "wan");
+        let out = resaved(
+            &web,
+            "provider=dynv6.com&lookup_host=home.dynv6.net&enabled=1",
+        );
+        for key in ["ip_source", "ip_network", "interface"] {
+            assert!(!out.contains_key(key), "{key} written: {out:?}");
+        }
+        let d = router();
+        let drawer =
+            serde_json::to_string(&drawer(&d, Some(&web), &web, &Errors::default())).unwrap();
+        assert!(!drawer.contains("\"ip_network\""), "{drawer}");
+        assert!(validate(
+            &d,
+            Some(&web),
+            &posted(
+                Some(&web),
+                &Form::parse("provider=dynv6.com&lookup_host=home.dynv6.net")
+            )
+        )
+        .get("ip_network")
+        .is_empty());
+    }
+
+    #[test]
+    fn a_save_moves_the_trigger_only_where_it_followed_the_network() {
+        let together = resaved(
+            &saved("", "wan", "wan"),
+            "provider=dynv6.com&lookup_host=home.dynv6.net&ip_network=wan6",
+        );
+        assert_eq!(together["ip_network"], "wan6");
+        assert_eq!(together["interface"], "wan6");
+        assert!(!together.contains_key("ip_source"));
+        let apart = resaved(
+            &saved("network", "wan", "lan"),
+            "provider=dynv6.com&lookup_host=home.dynv6.net&ip_network=wan6",
+        );
+        assert_eq!(apart["ip_network"], "wan6");
+        assert!(!apart.contains_key("interface"));
+    }
+
+    #[test]
+    fn a_cloudflare_email_sign_in_survives_a_save() {
+        let mut email = saved("", "wan", "wan");
+        email.provider = CLOUDFLARE.into();
+        email.username = "me@example.com".into();
+        let out = resaved(&email, "provider=cloudflare.com-v4&lookup_host=home.example.com&zone=example.com&ip_network=wan");
+        assert!(!out.contains_key("username"), "{out:?}");
+        let switched = resaved(&saved("", "wan", "wan"), "provider=cloudflare.com-v4&lookup_host=home.example.com&zone=example.com&ip_network=wan");
+        assert_eq!(switched["username"], "Bearer");
+    }
+
+    #[test]
+    fn an_updater_that_gave_up_says_so() {
+        let mut d = router();
+        d.services[0].live = None;
+        assert_eq!(state(&d, &d.services[0]), ("not running", "danger"));
+        d.known = false;
+        assert_eq!(state(&d, &d.services[0]), ("unknown", ""));
+    }
+}
