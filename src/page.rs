@@ -11,9 +11,9 @@
 use std::net::IpAddr;
 
 use verso_plugin::{
-    json, uci_text, ColumnWidth, CommitOp, Envelope, Errors, Field, Form, HeadingAct, Map,
-    RowDrawer, SelectOption, Table, TableCell, TableChip, TableColumn, TableRow, TableRowAct, Tone,
-    Value, Widget,
+    json, uci_text, ApplyAction, ColumnWidth, CommitOp, Envelope, Errors, Field, Form, HeadingAct,
+    Map, RowDrawer, SelectOption, Table, TableCell, TableChip, TableColumn, TableRow, TableRowAct,
+    Tone, Value, Widget,
 };
 
 use crate::model::{
@@ -34,6 +34,8 @@ const MASK: &str = "••••••••";
 pub const OPEN: &str = "open";
 pub const NEW: &str = "new";
 const DELETE: &str = "delete";
+/// UPDATE is a row's "update now", naming its section.
+pub const UPDATE: &str = "update";
 
 fn href(name: &str) -> String {
     format!("/plugins/ddns/?{OPEN}={name}")
@@ -50,8 +52,29 @@ pub fn page(d: &Ddns, open: &str) -> Envelope {
     listing(d, open, drawer)
 }
 
-/// post answers the open drawer: its save, or its confirmed delete.
+/// post answers a row's "update now", or the open drawer: its save, or its
+/// confirmed delete.
 pub fn post(d: &Ddns, open: &str, form: &Form) -> Envelope {
+    let update = form.get(UPDATE);
+    if !update.is_empty() {
+        return match d.service(&update).filter(|s| s.enabled) {
+            Some(s) => {
+                let mut page = listing(d, "", None).with_notice(
+                    Tone::Success,
+                    &format!("Sending {}’s address now.", s.hostname),
+                );
+                page.commands = vec![ApplyAction {
+                    name: "ddns-update".into(),
+                    args: [("section".into(), s.name.clone())].into(),
+                }];
+                page
+            }
+            None => listing(d, "", None).with_notice(
+                Tone::Danger,
+                "This name is not switched on, so nothing was sent.",
+            ),
+        };
+    }
     let existing = d.service(open);
     if open != NEW && existing.is_none() {
         return listing(d, "", None).with_notice(
@@ -411,12 +434,23 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
                 },
             },
             TableCell {
-                actions: vec![TableRowAct {
-                    icon: "square-pen".into(),
-                    title: "Edit".into(),
-                    href: door.clone(),
-                    ..Default::default()
-                }],
+                actions: s
+                    .enabled
+                    .then(|| TableRowAct {
+                        icon: "refresh-cw".into(),
+                        title: "Update now".into(),
+                        name: UPDATE.into(),
+                        value: s.name.clone(),
+                        ..Default::default()
+                    })
+                    .into_iter()
+                    .chain([TableRowAct {
+                        icon: "square-pen".into(),
+                        title: "Edit".into(),
+                        href: door.clone(),
+                        ..Default::default()
+                    }])
+                    .collect(),
                 ..Default::default()
             },
         ],
@@ -1103,6 +1137,34 @@ mod tests {
         s.network = "wan".into();
         s.v6 = false;
         assert_eq!(d.current(&s), "203.0.113.7".parse().ok());
+    }
+
+    #[test]
+    fn a_switched_on_row_sends_its_address_now() {
+        let d = router();
+        let row = &body(&page(&d, ""))["widget"]["rows"][0]["cells"][6]["actions"][0];
+        assert_eq!(row["icon"], "refresh-cw");
+        assert_eq!(row["name"], UPDATE);
+        assert_eq!(row["value"], "home");
+        let b = body(&post(&d, "", &Form::parse("update=home")));
+        assert_eq!(b["commands"][0]["name"], "ddns-update");
+        assert_eq!(b["commands"][0]["args"]["section"], "home");
+        assert!(b.get("commit").is_none());
+        assert_eq!(
+            b["notice"]["text"],
+            "Sending home.example.com’s address now."
+        );
+        // Switched off, or no longer there, nothing is sent.
+        let mut off = router();
+        off.services[0].enabled = false;
+        let none = body(&page(&off, ""))["widget"]["rows"][0]["cells"][6]["actions"].clone();
+        assert!(none.as_array().unwrap().iter().all(|a| a["name"] != UPDATE));
+        assert!(body(&post(&off, "", &Form::parse("update=home")))
+            .get("commands")
+            .is_none());
+        assert!(body(&post(&d, "", &Form::parse("update=gone")))
+            .get("commands")
+            .is_none());
     }
 
     #[test]

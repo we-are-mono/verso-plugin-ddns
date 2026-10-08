@@ -14,7 +14,8 @@
       { "scope": "ubus", "object": "verso", "function": "networkState" }
     ],
     "write": [
-      { "scope": "uci", "object": "ddns", "function": "write" }
+      { "scope": "uci", "object": "ddns", "function": "write" },
+      { "scope": "ubus", "object": "verso", "function": "ddnsUpdate" }
     ]
   }
 }
