@@ -415,8 +415,8 @@ fn columns() -> Vec<TableColumn> {
         ("Provider", "text", ColumnWidth::Name),
         ("Network", "entity", ColumnWidth::Word),
         ("Points at", "mono", ColumnWidth::Address),
-        ("State", "status", ColumnWidth::Word),
         ("Since last update", "runtime", ColumnWidth::Grow),
+        ("State", "status", ColumnWidth::Word),
         ("", "actions", ColumnWidth::Short),
     ]
     .into_iter()
@@ -475,11 +475,6 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
                     ..Default::default()
                 },
             },
-            TableCell {
-                text: state.into(),
-                variant: variant.into(),
-                ..Default::default()
-            },
             match live.updated {
                 Some(secs) => cell(&since(secs)),
                 None => TableCell {
@@ -487,6 +482,11 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
                     muted: true,
                     ..Default::default()
                 },
+            },
+            TableCell {
+                text: state.into(),
+                variant: variant.into(),
+                ..Default::default()
             },
             TableCell {
                 actions: s
@@ -952,12 +952,14 @@ mod tests {
         assert_eq!(cells[1]["text"], "Cloudflare · IPv4");
         assert_eq!(cells[2]["chips"][0]["label"], "wan");
         assert_eq!(cells[3]["text"], "203.0.113.7");
-        assert_eq!(cells[4]["text"], "running");
         // A span, not a sentence: the units read the same in every catalog,
         // and the column's heading says what it is the span since.
-        assert_eq!(b["widget"]["columns"][5]["label"], "Since last update");
-        assert_eq!(b["widget"]["columns"][5]["kind"], "runtime");
-        assert_eq!(cells[5]["text"], "2 h");
+        assert_eq!(b["widget"]["columns"][4]["label"], "Since last update");
+        assert_eq!(b["widget"]["columns"][4]["kind"], "runtime");
+        assert_eq!(cells[4]["text"], "2 h");
+        // The state reads last, beside the acts it explains.
+        assert_eq!(b["widget"]["columns"][5]["kind"], "status");
+        assert_eq!(cells[5]["text"], "running");
         assert!(!b.to_string().contains("s3cret"));
     }
 
