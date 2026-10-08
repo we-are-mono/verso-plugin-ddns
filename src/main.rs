@@ -30,3 +30,27 @@ fn post(request: &Request, form: &Form) -> Envelope {
         form,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every catalog key is English this plugin still says: rewording a string
+    /// orphans its translation, and this is where that shows.
+    #[test]
+    fn the_slovenian_catalog_has_no_orphans() {
+        let catalog: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(include_str!("../i18n/sl.json")).unwrap();
+        // A string continued over lines (`\` at the end) reads as one.
+        let source: String = [
+            include_str!("page.rs"),
+            include_str!("model.rs"),
+            include_str!("../manifest.json"),
+        ]
+        .concat()
+        .split("\\\n")
+        .map(str::trim_start)
+        .collect();
+        for key in catalog.keys() {
+            assert!(source.contains(&format!("\"{key}\"")), "orphaned: {key}");
+        }
+    }
+}

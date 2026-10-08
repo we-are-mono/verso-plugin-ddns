@@ -36,6 +36,9 @@ pub const NEW: &str = "new";
 const DELETE: &str = "delete";
 /// UPDATE is a row's "update now", naming its section.
 pub const UPDATE: &str = "update";
+/// SENDING is said once "update now" is on its way. It names no name: the
+/// row pressed is the one, and a sentence holding a value has no catalog key.
+const SENDING: &str = "Sending the address now.";
 
 fn href(name: &str) -> String {
     format!("/plugins/ddns/?{OPEN}={name}")
@@ -59,10 +62,7 @@ pub fn post(d: &Ddns, open: &str, form: &Form) -> Envelope {
     if !update.is_empty() {
         return match d.service(&update).filter(|s| s.enabled) {
             Some(s) => {
-                let mut page = listing(d, "", None).with_notice(
-                    Tone::Success,
-                    &format!("Sending {}’s address now.", s.hostname),
-                );
+                let mut page = listing(d, "", None).with_notice(Tone::Success, SENDING);
                 page.commands = vec![ApplyAction {
                     name: "ddns-update".into(),
                     args: [("section".into(), s.name.clone())].into(),
@@ -228,12 +228,8 @@ fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
         ),
         _ => {}
     }
-    if let Some(User::Typed(label)) = provider(&s.provider).map(|p| &p.user) {
-        e.check(
-            "username",
-            !s.username.is_empty(),
-            &format!("Enter the {}.", label.to_lowercase()),
-        );
+    if let Some(User::Typed(_)) = provider(&s.provider).map(|p| &p.user) {
+        e.check("username", !s.username.is_empty(), "Enter the username.");
     }
     e.check(
         "password",
@@ -394,7 +390,7 @@ fn columns() -> Vec<TableColumn> {
         ("Network", "entity", ColumnWidth::Word),
         ("Points at", "mono", ColumnWidth::Address),
         ("State", "status", ColumnWidth::Word),
-        ("Last update", "text", ColumnWidth::Grow),
+        ("Since last update", "runtime", ColumnWidth::Grow),
         ("", "actions", ColumnWidth::Short),
     ]
     .into_iter()
@@ -459,7 +455,7 @@ fn row(d: &Ddns, s: &Service, drawer: Option<RowDrawer>) -> TableRow {
                 ..Default::default()
             },
             match live.updated {
-                Some(secs) => cell(&ago(secs)),
+                Some(secs) => cell(&since(secs)),
                 None => TableCell {
                     text: DASH.into(),
                     muted: true,
@@ -544,13 +540,13 @@ fn private(ip: &IpAddr) -> bool {
     }
 }
 
-/// ago is how long since, the way a person says it.
-fn ago(secs: u64) -> String {
+/// since is a span in its largest unit, at least a minute. The units read
+/// the same in Slovenian, and a span carries no words a catalog would need.
+fn since(secs: u64) -> String {
     match (secs / 86400, secs / 3600, secs / 60) {
-        (0, 0, 0) => "just now".into(),
-        (0, 0, m) => format!("{m} min ago"),
-        (0, h, _) => format!("{h} h ago"),
-        (days, _, _) => format!("{days} d ago"),
+        (0, 0, m) => format!("{} min", m.max(1)),
+        (0, h, _) => format!("{h} h"),
+        (days, _, _) => format!("{days} d"),
     }
 }
 
@@ -691,10 +687,9 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
 /// up starts a check.
 fn source(d: &Ddns, s: &Service, e: &Errors) -> Vec<Widget> {
     if !s.edits_source() {
-        return vec![Widget::text(&format!(
-            "The address comes from `ip_source '{}'`, set outside this page. Saving keeps it.",
-            s.source
-        ))];
+        return vec![Widget::text(
+            "The address is read some other way, set outside this page (`ip_source`). Saving keeps it.",
+        )];
     }
     let mut fields = vec![helped(
         Widget::select(
@@ -712,22 +707,14 @@ fn source(d: &Ddns, s: &Service, e: &Errors) -> Vec<Widget> {
         "Behind another router, this router’s own address is a private one that providers refuse. Ask the internet instead.",
     )];
     if !s.by_network() {
-        let checker = if s.v6 {
-            "checkipv6.dyndns.com"
-        } else {
-            "checkip.dyndns.com"
+        // Whole sentences, one per family, so each has its catalog key.
+        let help = match s.v6 {
+            true => {
+                "Where the router asks for its public address. Empty asks checkipv6.dyndns.com."
+            }
+            false => "Where the router asks for its public address. Empty asks checkip.dyndns.com.",
         };
-        fields.push(
-            field(
-                "ip_url",
-                "Checked at",
-                &s.ip_url,
-                "",
-                &format!("Where the router asks for its public address. Empty asks {checker}."),
-                e,
-            )
-            .writes("ip_url"),
-        );
+        fields.push(field("ip_url", "Checked at", &s.ip_url, "", help, e).writes("ip_url"));
     }
     let (key, help) = match s.by_network() {
         true => (
@@ -800,14 +787,13 @@ fn timing(s: &Service, e: &Errors) -> Widget {
             pair("retry", "Retry after", "How long to wait after a failed update."),
             field(
                 "retry_max_count",
-                "Give up after",
+                "Tries before giving up",
                 &value("retry_max_count"),
                 "",
-                "Failed tries before the updater stops. 0 keeps trying.",
+                "The updater stops after this many failed tries in a row. 0 keeps trying.",
                 e,
             )
-            .writes("retry_max_count")
-            .counted_in("tries"),
+            .writes("retry_max_count"),
         ],
     )
     .ruled()
@@ -911,8 +897,20 @@ mod tests {
         assert_eq!(cells[2]["chips"][0]["label"], "wan");
         assert_eq!(cells[3]["text"], "203.0.113.7");
         assert_eq!(cells[4]["text"], "running");
-        assert_eq!(cells[5]["text"], "2 h ago");
+        // A span, not a sentence: the units read the same in every catalog,
+        // and the column's heading says what it is the span since.
+        assert_eq!(b["widget"]["columns"][5]["label"], "Since last update");
+        assert_eq!(b["widget"]["columns"][5]["kind"], "runtime");
+        assert_eq!(cells[5]["text"], "2 h");
         assert!(!b.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn spans_read_in_their_largest_unit() {
+        assert_eq!(since(0), "1 min");
+        assert_eq!(since(59 * 60), "59 min");
+        assert_eq!(since(3 * 3600 + 60), "3 h");
+        assert_eq!(since(2 * 86400), "2 d");
     }
 
     #[test]
@@ -1242,10 +1240,7 @@ mod tests {
         assert_eq!(b["commands"][0]["name"], "ddns-update");
         assert_eq!(b["commands"][0]["args"]["section"], "home");
         assert!(b.get("commit").is_none());
-        assert_eq!(
-            b["notice"]["text"],
-            "Sending home.example.com’s address now."
-        );
+        assert_eq!(b["notice"]["text"], SENDING);
         // Switched off, or no longer there, nothing is sent.
         let mut off = router();
         off.services[0].enabled = false;
