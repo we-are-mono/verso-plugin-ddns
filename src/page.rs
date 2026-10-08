@@ -22,7 +22,7 @@ use crate::model::{
 };
 
 const HEADING: &str = "Dynamic DNS";
-const EMPTY: &str = "No dynamic DNS yet. Add a name, and the router keeps it pointing at \
+const EMPTY: &str = "No dynamic DNS yet. Add a hostname, and the router keeps it pointing at \
      its own address whenever the connection gets a new one.";
 pub const REFUSED: &str = "Some values are missing, so nothing was saved. They’re marked below.";
 const KEEP_HELP: &str = "Leave empty to keep the saved one.";
@@ -205,30 +205,34 @@ fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
     e.check(
         "lookup_host",
         !s.hostname.is_empty(),
-        "Enter the name to keep up to date.",
+        "Enter the hostname to keep up to date.",
     );
     if existing.is_none() && !s.hostname.is_empty() {
         e.check(
             "lookup_host",
             d.service(&section_name(s)).is_none(),
-            "This name is already kept up to date over this address family.",
+            "This hostname is already kept up to date over this address family.",
         );
     }
     match s.provider.as_str() {
         CLOUDFLARE => {
-            e.check("zone", !s.zone.is_empty(), "Enter the zone the name is in.");
+            e.check(
+                "zone",
+                !s.zone.is_empty(),
+                "Enter the zone the hostname is in.",
+            );
             e.check(
                 "lookup_host",
                 s.zone.is_empty()
                     || s.hostname == s.zone
                     || s.hostname.ends_with(&format!(".{}", s.zone)),
-                "The name has to be in the zone.",
+                "The hostname has to be in the zone.",
             );
         }
         DUCKDNS => e.check(
             "lookup_host",
             s.hostname.is_empty() || s.hostname.ends_with(DUCKDNS_SUFFIX),
-            "A DuckDNS name ends in .duckdns.org.",
+            "A DuckDNS hostname ends in .duckdns.org.",
         ),
         CUSTOM => e.check(
             "update_url",
@@ -397,7 +401,7 @@ fn listing(d: &Ddns, open: &str, drawer: Option<RowDrawer>) -> Envelope {
     .with_width("wide")
     .with_tone("neutral")
     .with_act(HeadingAct {
-        label: "Add name".into(),
+        label: "Add hostname".into(),
         href: href(NEW),
         opens_panel: true,
         drawer: blank,
@@ -407,7 +411,7 @@ fn listing(d: &Ddns, open: &str, drawer: Option<RowDrawer>) -> Envelope {
 
 fn columns() -> Vec<TableColumn> {
     [
-        ("Name", "name", ColumnWidth::Long),
+        ("Hostname", "name", ColumnWidth::Long),
         ("Provider", "text", ColumnWidth::Name),
         ("Network", "entity", ColumnWidth::Word),
         ("Points at", "mono", ColumnWidth::Address),
@@ -594,12 +598,13 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
         .writes("service_name"),
         field(
             "lookup_host",
-            "Name",
+            "Hostname",
             &s.hostname,
             "fqdn",
-            "The full name, such as home.example.com.",
+            "The full hostname the provider gave you, such as myhome.duckdns.org.",
             e,
-        ),
+        )
+        .writes("lookup_host"),
     ];
     for p in &PROVIDERS {
         let mut children = Vec::new();
@@ -609,7 +614,7 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
                 "Zone",
                 &s.zone,
                 "fqdn",
-                "The domain the name is in, as Cloudflare lists it.",
+                "The domain the hostname is in, as Cloudflare lists it.",
                 e,
             ));
         }
@@ -629,7 +634,7 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
                     "Domain",
                     &s.domain,
                     "",
-                    "The name as this provider expects it, which can differ from the name above.",
+                    "The name as this provider expects it, which can differ from the hostname above.",
                     e,
                 )
                 .writes("domain"),
@@ -718,7 +723,7 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
     RowDrawer {
         title: match existing {
             Some(x) => x.hostname.clone(),
-            None => "New name".into(),
+            None => "New hostname".into(),
         },
         closed: "/plugins/ddns/".into(),
         open: true,
@@ -874,12 +879,17 @@ fn field(name: &str, label: &str, value: &str, datatype: &str, help: &str, e: &E
     })
 }
 
-/// secret is the provider's password or token, never read back onto the page.
+/// secret is the provider's password or token. It is a shared secret, so it is
+/// drawn with its eye to check it by, and what
+/// was just typed stands in it when the drawer comes back refused; a saved one
+/// is never put back.
 fn secret(label: &str, s: &Service, e: &Errors) -> Widget {
     Widget::Field(Field {
         name: "password".into(),
         label: label.into(),
         kind: "password".into(),
+        style: "reveal".into(),
+        value: s.password.clone(),
         key: "password".into(),
         help: if s.saved_password {
             KEEP_HELP.into()
@@ -1421,6 +1431,24 @@ mod tests {
         // Only the name that has it keeps it: a new one picks from the list.
         let fresh = posted(None, &Form::parse("provider=he.net&lookup_host=a.example.net&domain=a.example.net&password=x&ip_network=wan"));
         assert!(!validate(&d, None, &fresh).get("provider").is_empty());
+    }
+
+    #[test]
+    fn a_refused_save_keeps_the_token_just_typed_and_never_a_saved_one() {
+        let d = router();
+        let refused = body(&post(
+            &d,
+            NEW,
+            &Form::parse("provider=duckdns.org&lookup_host=myhome&password=tok&ip_network=wan"),
+        ));
+        assert_eq!(refused["notice"]["text"], REFUSED);
+        let typed = refused.to_string();
+        assert!(typed.contains(r#""style":"reveal""#), "{typed}");
+        assert!(typed.contains(r#""value":"tok""#), "{typed}");
+        // The saved Cloudflare token stays on the router.
+        let opened = body(&page(&d, "home")).to_string();
+        assert!(!opened.contains("s3cret"));
+        assert!(!opened.contains(r#""value":"tok""#));
     }
 
     #[test]
