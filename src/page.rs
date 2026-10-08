@@ -139,6 +139,7 @@ fn posted(existing: Option<&Service>, f: &Form) -> Service {
         provider: f.get("provider"),
         hostname: trimmed("lookup_host").to_lowercase(),
         zone: trimmed("zone").to_lowercase(),
+        domain: trimmed("domain"),
         username: trimmed("username"),
         password: f.get("password"),
         saved_password: existing.is_some_and(|s| s.saved_password),
@@ -187,11 +188,20 @@ fn section_name(s: &Service) -> String {
 fn validate(d: &Ddns, existing: Option<&Service>, s: &Service) -> Errors {
     let mut e = Errors::default();
     let custom = s.provider == CUSTOM;
+    // A provider outside the list stays only on the name that already has it.
+    let kept = s.elsewhere() && existing.is_some_and(|x| x.provider == s.provider);
     e.check(
         "provider",
-        custom || provider(&s.provider).is_some(),
+        custom || kept || provider(&s.provider).is_some(),
         "Choose a provider.",
     );
+    if kept {
+        e.check(
+            "domain",
+            !s.domain.is_empty(),
+            "Enter the domain as the provider expects it.",
+        );
+    }
     e.check(
         "lookup_host",
         !s.hostname.is_empty(),
@@ -287,6 +297,7 @@ fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
             format!("{host}@{}", s.zone)
         }
         DUCKDNS => s.hostname.trim_end_matches(DUCKDNS_SUFFIX).into(),
+        _ if s.elsewhere() => s.domain.clone(),
         _ => s.hostname.clone(),
     };
     let signed_in = existing.is_some_and(|x| x.provider == s.provider && !x.username.is_empty());
@@ -302,11 +313,20 @@ fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
     let flag = |on: bool| json!(if on { "1" } else { "0" });
     let mut out = Map::new();
     out.insert("enabled".into(), flag(s.enabled));
-    out.insert("service_name".into(), text(p.map(|p| p.id.to_string())));
+    // A provider outside the list is named as the section names it, and what
+    // its drawer does not show — an update URL, HTTPS — stays as it is.
+    let elsewhere = s.elsewhere();
+    let named = p.map(|p| p.id.to_string());
     out.insert(
-        "update_url".into(),
-        text(p.is_none().then(|| s.url.clone())),
+        "service_name".into(),
+        text(named.or_else(|| elsewhere.then(|| s.provider.clone()))),
     );
+    if !elsewhere {
+        out.insert(
+            "update_url".into(),
+            text(p.is_none().then(|| s.url.clone())),
+        );
+    }
     out.insert("domain".into(), json!(domain));
     out.insert("lookup_host".into(), json!(s.hostname));
     if let Some(username) = username {
@@ -316,10 +336,12 @@ fn writes(existing: Option<&Service>, s: &Service) -> Map<String, Value> {
         out.insert("password".into(), json!(s.password));
     }
     out.insert("use_ipv6".into(), flag(s.v6));
-    out.insert(
-        "use_https".into(),
-        flag(p.is_some() || s.url.starts_with("https://")),
-    );
+    if !elsewhere {
+        out.insert(
+            "use_https".into(),
+            flag(p.is_some() || s.url.starts_with("https://")),
+        );
+    }
     // A timing option is written when it differs from what the section reads
     // as now, so a save that changed none writes none, and a default is never
     // spelled out for its own sake.
@@ -551,9 +573,14 @@ fn since(secs: u64) -> String {
 }
 
 fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowDrawer {
-    let providers = PROVIDERS
-        .iter()
-        .map(|p| SelectOption::new(p.id, p.label))
+    // A provider set by hand outside the list leads it, under its own name, so
+    // the drawer opens on what the section says rather than on the first choice.
+    let kept = s
+        .elsewhere()
+        .then(|| SelectOption::new(&s.provider, &s.provider));
+    let providers = kept
+        .into_iter()
+        .chain(PROVIDERS.iter().map(|p| SelectOption::new(p.id, p.label)))
         .chain([SelectOption::new(CUSTOM, "Another provider (update URL)")])
         .collect();
     let mut fields = vec![
@@ -591,6 +618,25 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
         }
         children.push(secret(p.secret, s, e));
         fields.push(when(p.id, s, children));
+    }
+    if s.elsewhere() {
+        fields.push(when(
+            &s.provider,
+            s,
+            vec![
+                field(
+                    "domain",
+                    "Domain",
+                    &s.domain,
+                    "",
+                    "The name as this provider expects it, which can differ from the name above.",
+                    e,
+                )
+                .writes("domain"),
+                field("username", "Username", &s.username, "", "", e),
+                secret("Password", s, e),
+            ],
+        ));
     }
     fields.push(when(
         CUSTOM,
@@ -1320,6 +1366,61 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn he_net() -> Service {
+        let mut s = saved("", "wan", "wan");
+        s.provider = "he.net".into();
+        s.hostname = "home.example.net".into();
+        s.domain = "home.example.net".into();
+        s.username = "home.example.net".into();
+        s
+    }
+
+    #[test]
+    fn a_provider_outside_the_list_keeps_its_own_option_and_fields() {
+        let d = router();
+        let s = he_net();
+        let drawer = serde_json::to_value(drawer(&d, Some(&s), &s, &Errors::default())).unwrap();
+        let text = drawer.to_string();
+        assert!(
+            text.contains(r#"{"label":"he.net","value":"he.net"}"#),
+            "{text}"
+        );
+        // Its own fields are the ones shown, the domain among them.
+        fn find<'a>(v: &'a Value, hit: &dyn Fn(&Value) -> bool) -> Option<&'a Value> {
+            if hit(v) {
+                return Some(v);
+            }
+            match v {
+                Value::Array(a) => a.iter().find_map(|c| find(c, hit)),
+                Value::Object(o) => o.values().find_map(|c| find(c, hit)),
+                _ => None,
+            }
+        }
+        let own = find(&drawer, &|v| v["type"] == "when" && v["value"] == "he.net").unwrap();
+        assert_eq!(own["active"], true);
+        assert!(own.to_string().contains(r#""name":"domain""#), "{own}");
+    }
+
+    #[test]
+    fn a_provider_outside_the_list_saves_what_its_drawer_shows_and_nothing_else() {
+        let s = he_net();
+        let out = resaved(
+            &s,
+            "provider=he.net&lookup_host=home.example.net&domain=home.example.net&username=home.example.net&ip_network=wan",
+        );
+        assert_eq!(out["service_name"], "he.net");
+        assert_eq!(out["domain"], "home.example.net");
+        assert_eq!(out["username"], "home.example.net");
+        for key in ["update_url", "use_https", "password"] {
+            assert!(!out.contains_key(key), "{key} written: {out:?}");
+        }
+        let d = router();
+        assert!(validate(&d, Some(&s), &posted(Some(&s), &Form::parse("provider=he.net&lookup_host=home.example.net&domain=home.example.net&ip_network=wan"))).is_empty());
+        // Only the name that has it keeps it: a new one picks from the list.
+        let fresh = posted(None, &Form::parse("provider=he.net&lookup_host=a.example.net&domain=a.example.net&password=x&ip_network=wan"));
+        assert!(!validate(&d, None, &fresh).get("provider").is_empty());
     }
 
     #[test]

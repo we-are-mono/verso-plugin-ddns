@@ -127,6 +127,9 @@ pub struct Service {
     pub hostname: String,
     /// Cloudflare's zone, the part after `@` in its `domain`.
     pub zone: String,
+    /// `domain` as the section holds it, which a provider outside
+    /// [`PROVIDERS`] spells its own way.
+    pub domain: String,
     pub username: String,
     pub password: String,
     pub saved_password: bool,
@@ -250,6 +253,7 @@ impl Service {
             },
             hostname,
             zone: zone.into(),
+            domain: domain.clone(),
             username: s.scalar("username"),
             password: String::new(),
             saved_password: !s.scalar("password").is_empty(),
@@ -291,6 +295,12 @@ impl Service {
     /// script is set by hand and kept as it is.
     pub fn edits_source(&self) -> bool {
         self.by_network() || self.source == WEB
+    }
+
+    /// elsewhere is whether the provider is one ddns-scripts knows and this page
+    /// does not name: set by hand, kept as it is, its options shown verbatim.
+    pub fn elsewhere(&self) -> bool {
+        provider(&self.provider).is_none() && self.provider != CUSTOM && !self.provider.is_empty()
     }
 
     pub fn provider_label(&self) -> &str {
