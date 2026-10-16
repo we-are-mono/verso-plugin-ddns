@@ -19,11 +19,19 @@ fn main() {
     serve_described("ddns", get, post, describe::describe);
 }
 
+// The plugin is one page, at its own address: a hostname opens beside it by
+// query. Any path below it has nothing at it.
 fn get(request: &Request) -> Envelope {
+    if !request.path.trim_matches('/').is_empty() {
+        return Envelope::not_found();
+    }
     page::page(&model::Ddns::read(request), &request.query.get(page::OPEN))
 }
 
 fn post(request: &Request, form: &Form) -> Envelope {
+    if !request.path.trim_matches('/').is_empty() {
+        return Envelope::not_found();
+    }
     page::post(
         &model::Ddns::read(request),
         &request.query.get(page::OPEN),
@@ -33,6 +41,31 @@ fn post(request: &Request, form: &Form) -> Envelope {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use verso_plugin::{Snapshot, Ubus, Value};
+
+    fn at(path: &str) -> Request {
+        Request {
+            path: path.into(),
+            query: Form::default(),
+            snapshot: Snapshot::from_value(Value::Null),
+            ubus: Ubus::from_value(Value::Null),
+        }
+    }
+
+    /// The plugin is one page, at its own address; any other path has nothing
+    /// at it and says so, rather than passing for that page.
+    #[test]
+    fn a_path_below_the_page_has_nothing_at_it() {
+        for path in ["/nowhere", "/hosts/x"] {
+            assert!(get(&at(path)).not_found, "{path}");
+            assert!(post(&at(path), &Form::default()).not_found, "{path}");
+        }
+        for path in ["", "/"] {
+            assert!(!get(&at(path)).not_found, "{path}");
+        }
+    }
+
     /// Every catalog key is English this plugin still says: rewording a string
     /// orphans its translation, and this is where that shows.
     #[test]
