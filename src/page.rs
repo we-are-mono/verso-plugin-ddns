@@ -700,7 +700,7 @@ fn drawer(d: &Ddns, existing: Option<&Service>, s: &Service, e: &Errors) -> RowD
             &preview,
         ),
     ));
-    let mut children = vec![Widget::form("Save", fields)];
+    let mut children = vec![Widget::form("Save hostname", fields)];
     if existing.is_some() {
         children.push(Widget::Form {
             style: String::new(),

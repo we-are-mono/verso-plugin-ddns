@@ -65,7 +65,7 @@
   "minutes": "minut",
   "hours": "ur",
   "days": "dni",
-  "Save": "Shrani",
+  "Save hostname": "Shrani ime gostitelja",
   "Remove": "Odstrani",
   "The router stops updating this name once you apply. The name keeps the last address it was given.": "Ko uveljavite spremembe, usmerjevalnik preneha posodabljati to ime. Ime obdrži zadnji naslov, ki ga je dobilo.",
   "Choose a provider.": "Izberite ponudnika.",
